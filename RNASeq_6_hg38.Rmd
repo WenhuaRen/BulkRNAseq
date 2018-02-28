@@ -1,0 +1,926 @@
+---
+title: "RNASeq_6_hg38"
+author: "Wenhua Ren"
+date: "July 31, 2017"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+  html_document:
+    toc: yes
+---
+
+```{r global_options, include=FALSE}
+### Display everything in HTML format
+#knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 8, fig.path = 'figs/', cache=TRUE, results='markup')
+
+### hide all code chunks in PDF format
+ knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 8, fig.path = 'figs/', tidy = TRUE, cache=TRUE, results='markup')
+```
+
+Something to mention: Special thanks to Dr. Tzu Phang for putting together of the very first version of a basic RNAseq analysis report file based on the RNAseq workflow from bioconductor (https://www.bioconductor.org/help/workflows/rnaseqGene/). Afterwards both Ted Shade in the Genomics Core lab (who is also my linux system teacher when I started enter the field) and I have worked on testing it out and adding extra visualization code truncks. The version I am working mainly added a GSEA analysis using both GO and KEGG database. I also received great feedbacks from Dr. AC Tan and Dr. Jihye Kim regarding better ways to present a heatmap. I would like to get any critical comments about the codes and feel free to use some if it can be applied in your analysis.
+
+```{r House_Keeping, cache=FALSE}
+setwd("/home/wenhua/Documents/RNAseqReport")
+rm(list=ls())
+animal.model = 'Human'
+genome.version = 'hg38'
+mapping.algo = 'STAR(V2.5.2a)'
+count.table.cutoff = 5
+sanity.gene = 'To be provided'
+bcltofastq = 'bcl2fastq V2.16' 
+read.length = '1x51'
+pe.or.se = 'se' ## option: 'pe', 'se'
+stranded.mRNA = 'yes'
+project.title = 'RNASeq_6_20170717'
+project.description = 'Six primary cell line samples were collected and RNA extracted for sequencing experiment.'
+groups = 'One control and one treatment group with 3 replicates in each group' 
+
+## Load all the libraries here
+library("Rqc")
+library("ShortRead")
+library("GenomicAlignments")
+library("BiocParallel")
+library("GenomicFeatures")
+library("Rsamtools")
+library("DESeq2")
+library("pheatmap")
+library("RColorBrewer")
+library("PoiClaClu")
+library("ggplot2")
+library("AnnotationDbi")
+#biocLite("org.Mm.eg.db")
+library("org.Hs.eg.db")
+library("pander")
+```
+
+\newpage
+
+1. System and Experimental House Keeping
+=======================================
+## 1.1 Data Storage
+
+## 1.2 Sequencing Run Information
+* Paired-end(pe) or Single-end(se) Study: `r pe.or.se`
+* Total read length: `r read.length`
+* Stranded mRNA: `r stranded.mRNA`
+* FASTQ generating software: `r bcltofastq`
+
+## 1.3 Genome Information
+* This study uses `r animal.model` model
+* Genome version: `r genome.version`
+
+## 1.4 Investigator Information
+
+Name:  Dr. XXX
+
+## 1.5 Project Introduction and Experimental Design
+
+###Project Title
+Project Title: `r project.title`  
+
+###Project Description and Hypothesis 
+`r project.description` 
+
+###Factors and Levels:
+`r groups`
+
+## 1.6 Mapping Method
+Mapping algorithm used: `r mapping.algo` 
+
+```{r Mapping_Parameters, echo=TRUE}
+
+## STAR --runThreadN 3 --genomeDir /home/wen/Documents/Genome/Index/hg38_50 --readFilesCommand zcat --readFilesIn $t1l8 --outFileNamePrefix ./bam_hg38/$filenamel8 --outSAMtype BAM SortedByCoordinate --quantMode GeneCounts
+
+```
+
+## 1.7 Experiment Metadata  
+
+```{r Extract_Core_MetaData}
+
+## Import Demux file from the core lab
+demux.file = read.csv(file = './doc/demux.summary.csv', skip = 9, header = T)
+demux.file=demux.file[1:6,]
+colnames(demux.file)=c('Lane','Project','Sample','Barcode','Reads','PercoftheLane','PercperfectBarcode','PercOneMisMatch','FilteredReads','Yield','PercPF','PercQ30','Qscrore')
+demux.cell = demux.file$Lane
+demux.SampleName = as.character(demux.file$Sample)
+demux.SampleName=gsub("_illumina","",demux.SampleName)
+demux.Treatment=c(rep("Ctrl",3),rep("Trt",3))
+demux.PercQ30 = demux.file$PercQ30
+demux.barcode = as.character(demux.file$Barcode)
+demux.NumRead = demux.file$FilteredReads
+#this coversion from Factor to Numeric is not necessary unless later I need to yield the total reads from two lanes.
+demux.NumRead <- gsub(",","",demux.NumRead)
+demux.NumRead = as.numeric(as.character(demux.NumRead))
+demux.compile = cbind('Sample Name' = demux.SampleName,
+                      'Treament'= demux.Treatment,
+                      'PercQ30' = demux.PercQ30,
+                      'BarCode' = demux.barcode,
+                      'NumRead' = as.character(demux.NumRead))
+## Match the BAM file names
+demux.BamFileFullName = c("./bam_hg38/C1-illuminaAligned.sortedByCoord.out.bam",
+"./bam_hg38/C2-illuminaAligned.sortedByCoord.out.bam",
+"./bam_hg38/C3-illuminaAligned.sortedByCoord.out.bam",
+"./bam_hg38/T1-illuminaAligned.sortedByCoord.out.bam",
+"./bam_hg38/T2-illuminaAligned.sortedByCoord.out.bam",
+"./bam_hg38/T3-illuminaAligned.sortedByCoord.out.bam")
+
+tmp.bam = cbind('BAM file' = demux.BamFileFullName, 1)
+
+## Match the R1 FASTQ file names
+demux.FASTQFullName.R1 = c("./Trimmed/C1-illumina_S1_L008_R1_001.fastq.gz",
+"./Trimmed/C2-illumina_S1_L008_R1_001.fastq.gz",
+"./Trimmed/C3-illumina_S1_L008_R1_001.fastq.gz",
+"./Trimmed/T1-illumina_S1_L008_R1_001.fastq.gz",
+"./Trimmed/T2-illumina_S1_L008_R1_001.fastq.gz",
+"./Trimmed/T3-illumina_S1_L008_R1_001.fastq.gz")
+
+## Match the R1 FASTQ file names
+tmp.fastq1 = cbind('FASTQ read1' = demux.FASTQFullName.R1, 1)
+
+```
+### Sample Attributes   
+
+Sample annotation and sequencing run status for each sample:
+
+`r knitr::kable(demux.compile)`
+
+### FASTQ files:  
+
+`r knitr::kable(tmp.fastq1)`
+
+### BAM files:  
+
+`r knitr::kable(tmp.bam)`
+
+\newpage
+ 
+2. Rawdata QC and Sample Aligment    
+=================================
+
+##2.1 FASTQ Quality Plots
+
+Using the Bioconductor package  [Rqc](http://bioconductor.org/packages/release/bioc/vignettes/Rqc/inst/doc/Rqc.html) library to assess `FASTQ` quality
+
+```{r Import_Rqc_Rdata}
+##This part is run seperately in a R program using command line in my local computer.
+## R command used:
+library(Rqc)
+#ptm = proc.time()
+#rqcResultSet =rqc(path='/home/wen/Documents/CCData/170301Ghosh/Trimmed/paired',pattern='fastq.gz',openBrowser=T,workers=2)
+#time.ellapsed = proc.time() - ptm
+#cat('Ellapsed time is ' , time.ellapsed[3]/60, ' minutes\n\n') 
+#save(rqcResultSet,file='/home/wen/Documents/CCData/170301Ghosh/rqcResultSet.Rdata')
+
+load('./Rfiles/output/rqcResultSet.Rdata')
+
+```
+
+*Please note that any of the plots provided here is not there to tell you if your data is good or bad. It is to tell you if your data looks unusual in some way.*
+
+###Cycle-Specific Average Quality
+
+```{r Rqc_Cycle_Average_Quality}
+rqcCycleAverageQualityPlot(rqcResultSet)
+
+```
+Figure 1. The range of quality values (y-axis) are ploted against all bases at each base position in the FastQ file (x-axis). The higher the score the better the base call. For example, a quality score of 30 (Q30) means there is a 1 in 1000 probability of an incorrect base call. For most of the NGS platform the quality score degrade as the run progresses, so it is commom to see base call quality drop towards the end of a read. 
+
+\newpage
+
+### Cycle-Specific GC Content
+
+```{r Rqc_Cycle_GC_Content}
+rqcCycleGCPlot(rqcResultSet)
+
+```
+Figure 2. A line plot showing the average GC content (y-axis) for every cycle (x-axis) of sequencing. It is very common to see bias at the 5' end of many libraries. An article [link](http://nar.oxfordjournals.org/content/38/12/e131) has talked about this phenomenon in more detail.
+
+\newpage
+
+```{r Rqc_Average_Quality, eval=FALSE}
+rqcReadQualityPlot(rqcResultSet)
+
+```
+
+\newpage
+
+### Read Frequency Plot
+
+```{r Rqc_Read_Frequency}
+rqcReadFrequencyPlot(rqcResultSet)
+```
+Figure 3. This graph is a plot of the proportion of reads (y-axis) against the number of occurrences of the reads (x-axis). The plot shows the proportion of the library which is made up of sequences in each of the different duplication level bins. 
+
+\newpage
+
+## 2.2 Alignment Summary
+
+Calculate and summarize mapping statistics
+
+```{r Alignment_Summary}
+read_statsDF = read.table(file = './Alignment/Alignment.file', sep='\t', header=F, skip=5)
+read_statsDF$V1= gsub("\\|","",read_statsDF$V1)
+colnames(read_statsDF)=c("Features",paste0("C",c(seq(1:3))),paste0("T",c(seq(1:3))))
+#knitr::kable(read_statsDF)
+```
+
+```{r Alignment_Summary2}
+library("pander")
+pander(read_statsDF[,1:4], split.table = Inf, style = 'rmarkdown')
+```
+
+\newpage
+
+```{r Alignment_Summary3}
+pander(read_statsDF[,c(1,5:7)], split.table = Inf, style = 'rmarkdown')
+```
+
+\newpage
+
+3. Data Import and Preprocessing
+================================
+
+## 3.1 Build Annotation Database
+
+We will use the UCSC genome browser resource to build the databaset for gene model definition. Note: the current R version does not work with the makeTxDbFromUCSC for hg38 version human gene annotation, the annotation and the gene count step were done in R 3.4.1   
+
+```{r Annotation_Database, eval=FALSE}
+## Build annotaiton database, define Gene models
+library('GenomicFeatures')
+library('Rsamtools')
+library('rtracklayer')
+
+txdb=makeTxDbFromUCSC(genome=genome.version,tablename="knownGene")
+
+## Extract Genomic feature
+#produces a GRangesList of all the exons grouped by gene
+ebg = exonsBy(txdb,by='gene')
+
+## Define "sanity genes" Entrez Gene ID(s) from the database (first column gene ids)
+#sanity_id1 <- c("2065")
+#sanity_id2 <- c("XXXX")
+```
+
+
+```{r Annotation_Database_Display, eval =FALSE}
+txdb
+```
+
+*First Glance of Count Table*
+
+```{r Define_Gene_Model}
+## Load required library
+
+#register(SerialParam())
+#register(MulticoreParam(workers = 3))
+
+#filenames = demux.BamFileFullName
+#bamfiles <- BamFileList(filenames, yieldSize=2000000)
+
+## Catch if using the right genome
+## if Human; must have up to chr23
+## if mouse; must have up to chr19
+#seqlevels(bamfiles[2])
+
+if(file.exists('./Rfiles/output/se.Rdata')){
+  ## Load the file
+  load('./Rfiles/output/se.Rdata')
+}else{
+  ##Read counting  
+  ##this step is actually done seperated in R commandline  
+  ptm = proc.time()
+  #for paired end, stranded, specify the singleEnd to F and ignore.stand to T; set fragments to T if want to include single end reads or to F (default) to not include any single end reads .  
+  se=summarizeOverlaps(features=ebg,reads=bamfiles,mode='Union',singleEnd=F,ignore.strand=T,fragments=F)
+  # for single end stranded, DO NOT add singleEnd argument at all, it is a bug, it will generate inaccurate result 
+    #se = summarizeOverlaps(features = ebg, reads = bamfiles, mode='Union',ignore.strand = T)
+  time.ellapsed = proc.time() - ptm
+  cat('Ellapsed time is ' , time.ellapsed[3]/60, ' minutes\n\n')
+    
+    ## Save a copy on disk
+    save(se, file = './Rfiles/output/se.Rdata')
+}
+
+tmp.count = assay(se)
+#colnames(tmp.count) = gsub("Aligned.sortedByCoord.out.bam","",colnames(tmp.count))
+colnames(tmp.count)=demux.SampleName
+
+  #knitr::kable(head(tmp.count))
+pander(head(tmp.count[,1:2]), split.table = Inf, style = 'rmarkdown')
+
+```
+
+The gene model consists of:  
+`r dim(tmp.count)[1]` rows (genes)  
+`r dim(tmp.count)[2]` columns (samples)
+
+## 3.2 Define Phenotype Information
+
+```{r Define_Phenotype}
+
+colData(se) = DataFrame(SampleName = demux.SampleName,
+  Treatment=as.factor(demux.Treatment), 
+  BarCode = demux.barcode, 
+  NumOfRead = demux.NumRead)
+
+## Extract sample information
+#se$Treatment
+
+knitr::kable(colData(se))
+```
+
+4. Statistical Analysis
+=======================
+
+Statistical analysis of count data is performed with the `DESeq2` R package (M. I. Love, W. Huber, S. Anders: Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. Genome Biology 2014, 15:550). [link](http://dx.doi.org/10.1186/s13059-014-0550-8) 
+
+Note: DESeq2 internally corrects for library size, so raw counts were used for DESeq function. The DESeq functiom also takes into account the dependence of the variance of counts on the mean value during the dispersion estimation step.
+
+## 4.1 Create DESeq Object and Filtering
+
+```{r DESeq_Object}
+
+dds = DESeqDataSet(se, design=~Treatment) 
+
+```
+Before filtering the total reads counts from all samples <= `r count.table.cutoff`, the gene model consists of   
+`r dim(assay(dds))[1]` rows  
+
+```{r All_Zero_Filter}
+## Filter all zeros
+#nrow(dds)
+dds <- dds[ rowSums(counts(dds)) > count.table.cutoff, ]
+
+#nrow(dds)
+countdata = assay(dds) # this extracts the raw read counts
+colnames(countdata) = demux.SampleName
+
+```
+
+After filtering sum of reads <= `r count.table.cutoff`, the gene model consists of `r dim(assay(dds))[1]` rows (genes) and `r dim(assay(dds))[2]` columns (samples)
+
+## 4.2 Log Transformation
+
+### 4.2.1 A look at the regularized-logarithm transformation data
+
+```{r log_normalize}
+rld <- rlog(dds, blind=FALSE)
+# head(assay(rld), 3)
+rld.count=assay(rld)
+colnames(rld.count)=paste0("RLog2_",demux.SampleName)
+tmp.rld.count = head(assay(rld))
+colnames(tmp.rld.count) = demux.SampleName
+
+#knitr::kable(tmp.rld.count)
+pander(tmp.rld.count, split.table = Inf, style = 'rmarkdown')
+```
+
+\newpage  
+
+### 4.2.2 rLog Transformation and Log2 Transformation
+
+DESeq2 offers transformations for count data that stabilize the variance across the mean. One such transformation is the regularized-logarithm transformation or rlog (Love, Huber, and Anders 2014). For genes with high counts, the rlog transformation will give similar result to the ordinary log2 transformation of normalized counts. For genes with lower counts, however, the values are shrunken towards the genes’ averages across all samples. Using an empirical Bayesian prior on inter-sample differences in the form of a ridge penalty, the rlog-transformed data then becomes approximately homoskedastic, and can be used directly for computing distances between samples and making PCA plots. 
+
+_Note: both the log2 and the rlog transformation is provided for data visualization._ 
+
+```{r log_Plot}
+par( mfrow = c( 1, 2 ) )
+dds <- estimateSizeFactors(dds)
+plot(log2(counts(dds, normalized=TRUE)[,1:2] + 1),
+     pch=16, cex=0.3, xlab="Log2 value of FPKM of Sample1",ylab="Log2 value of FPKM of Sample2")
+plot(assay(rld)[,1:2],
+     pch=16, cex=0.3,xlab="rlog value of FPKM of Sample1",ylab="rlog value of FPKM of Sample2")
+
+```
+
+```{r log_distribution_heatmap, eval=FALSE}
+
+sampleDists <- dist( t( assay(rld) ) )
+# sampleDists
+
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) = paste(demux.SampleName,demux.Treatment,sep="_")
+#colnames(sampleDistMatrix)=paste(demux.SampleName[1:12],demux.respond[1:12],demux.tissue[1:12],demux.treament[1:12],sep="_")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+
+\newpage
+
+## 4.3 PCA Plot  
+
+```{r log_PCA}
+data <- plotPCA(rld, intgroup = 'Treatment', returnData=TRUE)
+percentVar <- round(100 * attr(data, "percentVar"))
+
+data$name = demux.SampleName
+
+ggplot(data, aes(PC1, PC2, color=Treatment, label = name)) + 
+  geom_point(size=3) +
+  geom_text(nudge_x = 2) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance"))
+
+#library(rgl)
+#pca = prcomp(t(assay(rld)), scale = T)
+#names(pca)
+#pca$sdev
+#cols = c(rep('red', 2), rep('blue', 2), rep('green',2), rep('yellow',2),rep('purple',2),rep('orange',2)) 
+#plot3d(pca$x[,1],pca$x[,2],pca$x[,3], col = cols, size = 12, xlab="PC1",ylab="PC2",zlab="PC3")
+#text3d(pca$x[,1],pca$x[,2],pca$x[,3], texts = demux.SampleName[1:18], adj = 1.5)
+#writeWebGL(filename = 'PCA_3D.webGL.html', width = 1000, height = 1000, font = 3)
+```
+
+\newpage  
+
+## 4.4 Differential Expression Analysis
+
+### 4.4.1 Analysis Result Column Discription
+
+```{r DESeq_Modeling}
+## Perform statistical analysis using DESeq model
+dds <- DESeq(dds)
+
+## Extracting results from the model
+res = results(dds, contrast=c("Treatment","Trt","Ctrl"))
+## Explain columns
+knitr::kable(mcols(res, use.names=TRUE))
+## result summary
+#summary(resBMI1)
+```
+
+### 4.4.2 Result Summary
+
+Result summary on the outliers, low counts etc for treated group compare to control group 
+
+```{r result summary1}
+summary(res)
+```
+
+### 4.4.3 Result Annotation
+
+```{r Result_Annotation_3 comparisons}
+#something to check for annotation
+#columns(org.Hs.eg.db)
+#keytypes(org.Hs.eg.db)
+#keytypes(txdb)
+#columns(txdb)
+res$symbol = mapIds(org.Hs.eg.db,
+            keys = row.names(res),
+            column ="SYMBOL",
+            keytype="ENTREZID",
+            multiVals="first")
+
+res$desc = mapIds(org.Hs.eg.db,
+           keys=row.names(res),
+           column="GENENAME",
+           keytype="ENTREZID",
+           multiVals="first")
+
+######added the below line of code, otherwise error out (by Wenhua)#########
+res = as.data.frame(res)
+res = cbind(res,rld.count,countdata)
+## Reorder based on pvalue
+res.byPval <- as.data.frame(res[order(res$pvalue),])
+
+```
+
+
+### 4.4.4 A Glance of The Final Output Table 
+
+```{r Export_Result}
+write.csv(res.byPval, file = './output/Res.byPvalue.csv', row.names = T)
+```
+
+Differentially expressed genes between treated vs. control group
+
+```{r Final_Output_Table_group 1}
+panderOptions('round',5)
+pander(head(res.byPval[, c(2,5:8)]), split.cells = 30, table.continues="",table.caption.prefix="",split.table=Inf)
+```
+
+\newpage
+
+```{R Final_Output_Table_group 2}
+pander(head(res.byPval[, c(7,9:11)]), split.cells = 30, table.continues="",table.caption.prefix="",split.table=Inf)
+pander(head(res.byPval[, c(7,12:14)]), split.cells = 30, table.continues="",table.caption.prefix="",split.table=Inf)
+```
+
+\newpage
+
+## 4.5 Heatmap for the Top 100 Significant Up- or Down- Regulated Genes
+
+```{r heatmaps_A20 groups} 
+library("pheatmap")
+HM=res[abs(res$log2FoldChange)>2,]
+HM = HM[head(order(HM$pvalue,decreasing=FALSE),100),]
+
+#prepare COUNT MATRICS (rlog of the read count, shrinkage log2 value) with the rlog value of each of the samples
+mat = assay(rld)[rownames(HM),]
+#normalize the data by substracting the rowmeans and then divided by the sd
+mat=(mat- rowMeans(mat))/sd(mat)
+
+############Extract the colname and rowname information and assign to the pheatmap file####################
+# Change the rowname to Gene name. unique is true will assign indexing number starting from 1, if the same genename occurred more than once.
+rownames(HM)=make.names(HM$symbol,unique=TRUE)
+rownames(mat)=rownames(HM)
+df=as.data.frame(colData(dds)["Treatment"])
+
+########Important to change the row name
+ppi = 300
+my_palette <- colorRampPalette(c("navy", "white", "firebrick3"))(50)
+#my_palette1 = colorRampPalette(c("blue", "white", "red"))(100)
+
+#png("HM.png",width=16*ppi, height=22*ppi, res=ppi)
+#pheatmap(mat.yes,annotation_col = df, main="Top 50 genes by adjusted p-value",fontsize = 15, cellwidth = 45, cellheight =18, color = my_palette)
+#pheatmap(mat,annotation_col = df, show_colnames = F,main="Top 100 genes by adjusted p-value",color = my_palette,fontsize = 14, cellwidth = 80, cellheight =14)
+
+#dev.off()
+
+```
+
+\begin{center}
+\includegraphics[width=12cm,height=20cm,keepaspectratio]{./HM.png}
+\end{center}
+
+Figure 4: Heatmap showing the top 100 significant DE genes within genes which has Log2FC greater than 2 between treated vs. control group
+
+\newpage
+
+5. Gene Set Enrichment Analysis 
+===============================
+
+GSEA (Generally Applicable Gene-set Enrichment) analysis is performed with the R package: `gage` [link](http://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-10-161) and `pathviwe` [link](http://bioinformatics.oxfordjournals.org/content/early/2013/06/11/bioinformatics.btt285.full).  
+
+GAGE uses one-on-one comparison (single array analysis) approach for gene set analysis. The four major steps of the analysis are: Step 1 sample pairing (setting up wether it is paired or un-paired experiment), Step 2 per gene tests to yield individual p-values from multiple one-on-one test, Step 3, gene set tests and Step 4, meta-test summarization to summarize individual p-values and generate the gloabl p-values. 
+
+Results include three heatmaps on whole gene set which are significant at FDR<0.1. Up-test: signficant up-regulated KEGG pathways are shown by the -log10(p-value); Down-test: signficant down-regulated KEGG pathways are shown by the -log10(p-value); GAGE test statistics: signficant KEGG pathways in 2-directional test are shown by test statistics instead of log10(p-value). 
+
+Results also include heatmaps by expression for above-backgroup genes in specified top gene set(s) which are up- or down- regulated by treatment.
+
+Results also include KEGG pathway graph of the specified top gene set(s) which are up- or down- regulated by treatment. The genes in the graph are color coded based on the Log fold change value. 
+
+Note: only some of the graphs are included in this report and the results are in folder pathview/EssGene, pathview/Graph. The tables coresponding to the graphs are saved in pathview/Table
+
+
+## 5.1 Top Pathways between treated vs. control group
+
+```{r gage pathway for A20, results='hide'}
+
+library("pathview")
+library("gage")
+library("gageData")
+
+#The advantage of using kegg.gsets is that you get the most updated pathway gene set data as it is retrieved from KEGG in real time.
+
+#Look up the spices information for KEGG database
+#kegg.gsets works with 3000 KEGG species,for examples:
+#data(korg)
+#head(korg[,1:3],50)
+
+data("kegg.gs")
+#data("go.gs")
+
+########Expression data preparation########
+colnames(rld.count) = demux.SampleName
+#Group ID preparation, note that in some cases when there are only two groups, the sample index needs to be adjusted in gageData function
+
+Ctrl=c(1:3)
+Trt=c(4:6)
+
+##########Gage analysis with one on one unpaired comparissn################
+#1. gage function
+kegg.p2 = gage(rld.count, gsets = kegg.gs, ref = Ctrl, samp = Trt, compare="unpair", heatmap = TRUE)
+#2. generate a heatmap for signcant gene sets based on q- or p-value cutoff.
+kegg.sig=sigGeneSet(kegg.p2, heatmap=T,pdf.size = c(11,8),lhei=c(0.5, 2), lwid=c(0.2,1),cexCol=1,cexRow=0.8,cutoff = 0.1, outname = "KEGG",margin=c(4,20))
+
+#3. extract top up-regulated pathways and export heatmap one by one, here only extract 1 gene set
+gs=unique(unlist(kegg.gs[rownames(kegg.p2$greater)[1]]))
+essData=essGene(gs, rld.count, ref = Ctrl, samp = Trt)
+
+###################################
+data("egSymb")
+egSymb=as.data.frame(egSymb[egSymb[,1] %in% rownames(essData),])
+essData=merge(egSymb,essData,by.x="eg",by.y="row.names")
+rn=essData$sym
+essData=essData[,3:8]
+rownames(essData)=rn
+
+###################################
+geneData(genes = rownames(essData), essData, ref = c(1:3), samp = c(4:6), outname = "upTop1.essGene",
+  txt = TRUE, heatmap = TRUE,scatterplot = FALSE, samp.mean = FALSE,
+  lhei=c(0.5, 2), lwid=c(0.5,1),cexCol=1.2,cexRow=1.2,
+  pdf.size = c(11,8), margin=c(10,20), cols = NULL, scale = "row", limit = NULL,
+  label.groups = TRUE)
+
+#4. extract top down-regulated pathways and export heatmap one by one, here only extract 1 gene set
+gs=unique(unlist(kegg.gs[rownames(kegg.p2$less)[1]]))
+essData=essGene(gs, rld.count, ref = Ctrl, samp = Trt)
+
+###################################
+data("egSymb")
+egSymb=as.data.frame(egSymb[egSymb[,1] %in% rownames(essData),])
+essData=merge(egSymb,essData,by.x="eg",by.y="row.names")
+rn=essData$sym
+essData=essData[,3:8]
+rownames(essData)=rn
+###################################
+
+geneData(genes = rownames(essData), essData, ref = c(1:3), samp = c(4:6), outname = "dnTop1.essGene",
+  txt = TRUE, heatmap = TRUE,scatterplot = FALSE, samp.mean = FALSE,
+  lhei=c(0.5, 2), lwid=c(0.5,1),cexCol=1.2,cexRow=1.2,
+  pdf.size = c(11,8), margin=c(10,20), cols = NULL, scale = "row", limit = NULL,
+  label.groups = TRUE)
+```
+
+Top 6 up-regulated pathway by treatment
+
+```{r viewKegg up} 
+pander(head(kegg.p2$greater[,4:5]), split.table = Inf, style = 'rmarkdown')
+```
+
+Top 6 down-regulated pathway by treatment
+
+```{r viewKegg down} 
+pander(head(kegg.p2$less[,4:5]), split.table = Inf, style = 'rmarkdown')
+```
+
+\begin{center}
+\includegraphics[width=20cm,height=20cm,keepaspectratio]{./KEGG.gs.heatmap.pdf}
+\end{center}
+
+Figure 5. heatmap on all significantly changed gene pathways in treated from control.
+
+\begin{center}
+\includegraphics[width=15cm,height=15cm,keepaspectratio]{./upTop1.essGene.geneData.heatmap.pdf}
+\end{center}
+
+Figure 6. gene expresion perturbations in top one up-regulated gene set in treated vs. control (only those genes which are above-background expression change in the gene set are shown).
+
+\newpage
+
+\begin{center}
+\includegraphics[width=15cm,height=15cm,keepaspectratio]{./dnTop1.essGene.geneData.heatmap.pdf}
+\end{center}
+
+Figure 7. gene expresion perturbations in top one down-regulated gene set in treated vs. control (only those genes which are above-background expression change in the gene set are shown).
+
+## 5.2 Top Up-regulated Kegg Gene Network Pathway 
+
+```{R pathview A20}
+
+#########Extract pathway names with qval < 1 for UP-regulated pathways########
+kegg.fc=as.data.frame(res$log2FoldChange)
+rownames(kegg.fc)=rownames(res)
+
+sel = kegg.p2$greater[, "q.val"] < 0.1 &!is.na(kegg.p2$greater[, "q.val"])
+path.ids = rownames(kegg.p2$greater)[sel]
+path.ids2 = substr(path.ids, 1, 8)
+
+#view top 3 up-regulated pathways
+#Native KEGG
+pv.out.list <- sapply(path.ids2[1:3], function(pid) pathview(gene.data = kegg.fc, pathway.id = pid,species = "hsa", out.suffix=c("up"), kegg.dir = "./pathview",kegg.native = T))
+
+#Graphviz view
+pv.out.list <- sapply(path.ids2[1:3], function(pid) pathview(gene.data = kegg.fc, pathway.id = pid, species = "hsa", kegg.native=F,sign.pos="bottomright", kegg.dir = "./pathview",out.suffix=c("up")))
+
+#####Extract pathway names with qval < 0.1 for DOWN-regulated pathway#############3
+sel = kegg.p2$less[, "q.val"] < 0.1 &!is.na(kegg.p2$less[, "q.val"])
+path.ids = rownames(kegg.p2$less)[sel]
+path.ids2 = substr(path.ids, 1, 8)
+
+#view top 3 up-regulated pathways
+#Native KEGG
+pv.out.list <- sapply(path.ids2[1:3], function(pid) pathview(gene.data = kegg.fc, pathway.id = pid,species = "hsa", out.suffix=c("dn"), kegg.dir = "./pathview",kegg.native = T))
+
+#Graphviz view
+pv.out.list <- sapply(path.ids2[1:3], function(pid) pathview(gene.data = kegg.fc, pathway.id = pid, species = "hsa", kegg.native=F,sign.pos="bottomright", kegg.dir = "./pathview",out.suffix=c("dn")))
+```
+
+\begin{center}
+\includegraphics[width=15cm,height=15cm,keepaspectratio]{./hsa04141.up.png}
+\end{center}
+
+\newpage
+
+## 5.3 Top Down-regulated Kegg Gene Network Pathway 
+
+\begin{center}
+\includegraphics[width=15cm,height=15cm,keepaspectratio]{./hsa00100.dn.png}
+\end{center}
+
+\newpage
+
+6. GO Pathway Analysis
+
+```{R Go pathway}
+#GO analysis, separate BP, MF and CC categories
+data(go.sets.hs)
+data(go.subs.hs)
+go.bp = go.sets.hs[go.subs.hs$BP]
+go.mf = go.sets.hs[go.subs.hs$MF]
+go.cc = go.sets.hs[go.subs.hs$CC]
+
+##for version R 3.1, below code works 
+#data(go.gs)
+#go.hs=go.gsets(species="human")
+#go.bp=go.hs$go.sets[go.hs$go.subs$BP]
+#go.mf=go.hs$go.sets[go.hs$go.subs$MF]
+#go.cc=go.hs$go.sets[go.hs$go.subs$CC]
+#save(go.bp, go.mf, go.cc, file="go.hs.gsets.RData")
+
+bp.p <- gage(rld.count, gsets = go.sets.hs[go.subs.hs$BP], ref = c(1:3), samp = c(4:6))
+mf.p <- gage(rld.count, gsets = go.sets.hs[go.subs.hs$MF], ref = c(1:3), samp = c(4:6))
+cc.p <- gage(rld.count, gsets = go.sets.hs[go.subs.hs$CC], ref = c(1:3), samp = c(4:6))
+
+```
+
+## 6.1 GO BP Pathway
+
+```{R GO_BP Pathway}
+#BP.sig=sigGeneSet(bp.p, heatmap=T,pdf.size = c(11,8),lhei=c(0.5, 2), lwid=c(0.2,1),cexCol=1,cexRow=0.8,cutoff = 0.05, outname = "GO.BP",margin=c(4,20))
+
+#3. extract top up-regulated pathways and export heatmap one by one, here only extract 1 gene set
+gs=unique(unlist(go.bp[rownames(bp.p$greater)[1]]))
+essData=essGene(gs, rld.count, ref = Ctrl, samp = Trt)
+
+###################################
+data("egSymb")
+egSymb=as.data.frame(egSymb[egSymb[,1] %in% rownames(essData),])
+essData=merge(egSymb,essData,by.x="eg",by.y="row.names")
+rn=essData$sym
+essData=essData[,3:8]
+rownames(essData)=rn
+
+###################################
+geneData(genes = rownames(essData), essData, ref = c(1:3), samp = c(4:6), outname = "GO.BP.upTop1.essGene",
+  txt = TRUE, heatmap = TRUE,scatterplot = FALSE, samp.mean = FALSE,
+  lhei=c(0.5, 2), lwid=c(0.5,1),cexCol=1.2,cexRow=1.2,
+  pdf.size = c(11,8), margin=c(2,20), cols = NULL, scale = "row", limit = NULL,
+  label.groups = TRUE)
+
+#4. extract top down-regulated pathways and export heatmap one by one, here only extract 1 gene set
+gs=unique(unlist(go.bp[rownames(bp.p$less)[1]]))
+essData=essGene(gs, rld.count, ref = Ctrl, samp = Trt)
+
+###################################
+data("egSymb")
+egSymb=as.data.frame(egSymb[egSymb[,1] %in% rownames(essData),])
+essData=merge(egSymb,essData,by.x="eg",by.y="row.names")
+rn=essData$sym
+essData=essData[,3:8]
+rownames(essData)=rn
+###################################
+
+geneData(genes = rownames(essData), essData, ref = c(1:3), samp = c(4:6), outname = "GO.bp.dnTop1.essGene",
+  txt = TRUE, heatmap = TRUE,scatterplot = FALSE, samp.mean = FALSE,
+  lhei=c(0.5, 2), lwid=c(0.5,1),cexCol=1.2,cexRow=1.2,
+  pdf.size = c(11,8), margin=c(2,20), cols = NULL, scale = "row", limit = NULL,
+  label.groups = TRUE)
+
+```
+
+## 6.1 GO MF Pathway
+
+```{R MF pahtway}
+#3. extract top up-regulated pathways and export heatmap one by one, here only extract 1 gene set
+gs=unique(unlist(go.mf[rownames(mf.p$greater)[1]]))
+essData=essGene(gs, rld.count, ref = Ctrl, samp = Trt)
+
+###################################
+data("egSymb")
+egSymb=as.data.frame(egSymb[egSymb[,1] %in% rownames(essData),])
+essData=merge(egSymb,essData,by.x="eg",by.y="row.names")
+rn=essData$sym
+essData=essData[,3:8]
+rownames(essData)=rn
+
+###################################
+geneData(genes = rownames(essData), essData, ref = c(1:3), samp = c(4:6), outname = "GO.mf.upTop1.essGene",
+  txt = TRUE, heatmap = TRUE,scatterplot = FALSE, samp.mean = FALSE,
+  lhei=c(0.5, 2), lwid=c(0.5,1),cexCol=1.2,cexRow=1.2,
+  pdf.size = c(11,8), margin=c(10,20), cols = NULL, scale = "row", limit = NULL,
+  label.groups = TRUE)
+
+#4. extract top down-regulated pathways and export heatmap one by one, here only extract 1 gene set
+gs=unique(unlist(go.bp[rownames(bp.p$less)[1]]))
+essData=essGene(gs, rld.count, ref = Ctrl, samp = Trt)
+
+###################################
+data("egSymb")
+egSymb=as.data.frame(egSymb[egSymb[,1] %in% rownames(essData),])
+essData=merge(egSymb,essData,by.x="eg",by.y="row.names")
+rn=essData$sym
+essData=essData[,3:8]
+rownames(essData)=rn
+###################################
+geneData(genes = rownames(essData), essData, ref = c(1:3), samp = c(4:6), outname = "GO.mf.dnTop1.essGene",
+  txt = TRUE, heatmap = TRUE,scatterplot = FALSE, samp.mean = FALSE,
+  lhei=c(0.5, 2), lwid=c(0.5,1),cexCol=1.2,cexRow=1.2,
+  pdf.size = c(11,8), margin=c(8,20), cols = NULL, scale = "row", limit = NULL,
+  label.groups = TRUE)
+
+```
+
+## 6.1 GO CC Pathway
+
+```{R CC pathway}
+#3. extract top up-regulated pathways and export heatmap one by one, here only extract 1 gene set
+gs=unique(unlist(go.cc[rownames(cc.p$greater)[1]]))
+essData=essGene(gs, rld.count, ref = Ctrl, samp = Trt)
+
+###################################
+data("egSymb")
+egSymb=as.data.frame(egSymb[egSymb[,1] %in% rownames(essData),])
+essData=merge(egSymb,essData,by.x="eg",by.y="row.names")
+rn=essData$sym
+essData=essData[,3:8]
+rownames(essData)=rn
+
+###################################
+geneData(genes = rownames(essData), essData, ref = c(1:3), samp = c(4:6), outname = "GO.cc.upTop1.essGene",
+  txt = TRUE, heatmap = TRUE,scatterplot = FALSE, samp.mean = FALSE,
+  lhei=c(0.5, 2), lwid=c(0.5,1),cexCol=1.2,cexRow=1.2,
+  pdf.size = c(11,8), margin=c(2,20), cols = NULL, scale = "row", limit = NULL,
+  label.groups = TRUE)
+
+#4. extract top down-regulated pathways and export heatmap one by one, here only extract 1 gene set
+gs=unique(unlist(go.cc[rownames(cc.p$less)[1]]))
+essData=essGene(gs, rld.count, ref = Ctrl, samp = Trt)
+
+###################################
+data("egSymb")
+egSymb=as.data.frame(egSymb[egSymb[,1] %in% rownames(essData),])
+essData=merge(egSymb,essData,by.x="eg",by.y="row.names")
+rn=essData$sym
+essData=essData[,3:8]
+rownames(essData)=rn
+###################################
+geneData(genes = rownames(essData), essData, ref = c(1:3), samp = c(4:6), outname = "GO.cc.dnTop1.essGene",
+  txt = TRUE, heatmap = TRUE,scatterplot = FALSE, samp.mean = FALSE,
+  lhei=c(0.5, 2), lwid=c(0.5,1),cexCol=1.2,cexRow=1.2,
+  pdf.size = c(11,8), margin=c(15,20), cols = NULL, scale = "row", limit = NULL,
+  label.groups = TRUE)
+
+
+##########Save the full records out######################3
+gs=unlist(names(go.cc))
+genes=as.data.frame(as.matrix(go.cc[gs]))
+
+library(org.Hs.eg.db)
+library(annotate)
+genes$V2 <- sapply(genes$V1,getSYMBOL,data='org.Hs.eg')
+genes$V2 <- vapply(genes$V2, paste, collapse = ", ", character(1L))
+genes$V1 <- vapply(genes$V1, paste, collapse = ", ", character(1L))
+genes$GO=rownames(genes)
+#search up: two ways to use sapply, sapply can apply a function to each row of the table 
+#sapply(allcolscomb, sd, na.rm=TRUE)
+#sapply(allcolscomb, function(x) sd(x, na.rm=TRUE))
+GO.cc.up=cc.p$greater[,3:5]
+GO.cc.up=na.omit(GO.cc.up)
+GO.cc.dn=cc.p$less[,3:5]
+GO.cc.dn=na.omit(GO.cc.dn)
+
+GO.cc.up=merge(GO.cc.up,genes,by="row.names",all.x=TRUE)
+GO.cc.dn=merge(GO.cc.dn,genes,by="row.names",all.x=TRUE)
+GO.cc.up=GO.cc.up[order(GO.cc.up$p.val,decreasing = FALSE),]
+GO.cc.dn=GO.cc.up[order(GO.cc.dn$p.val,decreasing = FALSE),]
+write.csv(GO.cc.up, file='./output/GO.cc.up.csv')
+write.csv(GO.cc.dn, file='./output/GO.cc.down.csv')
+
+gs=unlist(names(go.mf))
+genes=as.data.frame(as.matrix(go.mf[gs]))
+
+library(org.Hs.eg.db)
+library(annotate)
+genes$V2 <- sapply(genes$V1,getSYMBOL,data='org.Hs.eg')
+genes$V2 <- vapply(genes$V2, paste, collapse = ", ", character(1L))
+genes$V1 <- vapply(genes$V1, paste, collapse = ", ", character(1L))
+genes$GO=rownames(genes)
+
+GO.mf.up=mf.p$greater[,3:5]
+GO.mf.up=na.omit(GO.mf.up)
+GO.mf.dn=mf.p$less[,3:5]
+GO.mf.dn=na.omit(GO.mf.dn)
+
+GO.mf.up=merge(GO.mf.up,genes,by="row.names",all.x=TRUE)
+GO.mf.dn=merge(GO.mf.dn,genes,by="row.names",all.x=TRUE)
+GO.mf.up=GO.mf.up[order(GO.mf.up$p.val,decreasing = FALSE),]
+GO.mf.dn=GO.mf.dn[order(GO.mf.dn$p.val,decreasing = FALSE),]
+write.csv(GO.mf.up, file='./output/GO.mf.up.csv')
+write.csv(GO.mf.dn, file='./output/GO.mf.down.csv')
+
+```
+
+7. Session Information
+======================
+
+```{r Session_Info, cache=FALSE, echo= FALSE, results='markup', message=FALSE, warning=FALSE, tidy=TRUE}
+
+sessionInfo()
+
+```
